@@ -1,0 +1,9 @@
+FROM scratch
+# scratch 没有 CA 根证书，Go HTTPS 会 x509 失败——从构建上下文拷贝
+COPY ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY zai-api-linux /zai-api
+ENV PORT=3001 HOST=0.0.0.0
+EXPOSE 3001
+WORKDIR /data
+VOLUME ["/data"]
+ENTRYPOINT ["/zai-api"]
