@@ -453,7 +453,13 @@ func sendToZAIStream(prompt string, opts struct {
     AdvancedSearch    bool
 }, ch chan<- ZAIResult) error {
 
-    for attempt := 0; attempt < 2; attempt++ {
+    // 重试预算：池内每个账号 token 至少一次机会（401/封禁轮换），无池时保持
+    // 原来的 2 次（guest 重试一次）。
+    maxAttempts := 2
+    if n := accountTokenCount(); n > 0 {
+        maxAttempts = n + 1
+    }
+    for attempt := 0; attempt < maxAttempts; attempt++ {
         // Issue #41: while the breaker believes the egress IP is blocked by
         // the Aliyun WAF, do not spend a captcha (each costs a harvested
         // device token and ~10-15 s of signing) on a request that is
@@ -608,6 +614,22 @@ func sendToZAIStream(prompt string, opts struct {
             cancel()
             if config.Logging.Level == "debug" {
                 log.Println("[DEBUG] Z.AI error body:", string(errBody))
+            }
+            // 账号级封禁（USER_BLOCKED 等）：与 401 同等处理——标记失败并轮换到
+            // 池里下一个账号 token，而不是把整个请求报错出去。
+            if resp.StatusCode == 403 && strings.Contains(string(errBody), "USER_BLOCKED") {
+                session.mu.Lock()
+                if session.TokenID != 0 {
+                    markAccountTokenResult(session.TokenID, false)
+                    log.Printf("[Session] Account token #%d blocked (USER_BLOCKED); rotating", session.TokenID)
+                }
+                session.TokenID = 0
+                session.Initialized = false
+                session.mu.Unlock()
+                if err := initializeSession(); err != nil {
+                    return err
+                }
+                continue
             }
             // Issue #41: the Aliyun WAF block page comes back as 405 with
             // the block HTML. Detect it, trip the breaker, and surface a

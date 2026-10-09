@@ -65,6 +65,11 @@ type Config struct {
         Format string
     }
     KnownModels []string
+    // CaptchaOptional lets completions proceed with an empty
+    // captcha_verify_param when the device-token pool is empty, instead of
+    // hard-failing — for deployments where the account-token path is trusted
+    // upstream. Default off (strict, upstream behavior unchanged).
+    CaptchaOptional bool
     // StreamHoldback is the number of runes kept pending at the tail of the
     // streamed content before it is forwarded to clients. Z.AI's stream is
     // edit-based (edit_content can backtrack and rewrite the tail), and an
@@ -191,6 +196,14 @@ func loadConfig() *Config {
     if h := os.Getenv("STREAM_HOLDBACK"); h != "" {
         if n, err := strconv.Atoi(h); err == nil && n >= 0 {
             c.StreamHoldback = n
+        }
+    }
+    if v := os.Getenv("CAPTCHA_OPTIONAL"); v != "" {
+        switch strings.ToLower(strings.TrimSpace(v)) {
+        case "1", "true", "yes", "on":
+            c.CaptchaOptional = true
+        case "0", "false", "no", "off":
+            c.CaptchaOptional = false
         }
     }
     // SYNC_MODE restores the legacy synchronous session flow (one chat

@@ -591,6 +591,13 @@ func (c *CaptchaCache) generate() {
     c.mu.Unlock()
 }
 
+// captchaOptional reports whether an empty device-token pool should yield an
+// empty captcha_verify_param (request proceeds; upstream decides) instead of
+// failing the request outright. Default off — strict, upstream-compatible.
+func captchaOptional() bool {
+    return config.CaptchaOptional
+}
+
 // ============================================================================
 // CAPTCHA VERIFICATION PARAM — IN-MEMORY (no FIFO / named pipe)
 // ============================================================================
@@ -605,6 +612,13 @@ var captchaParamOverride string
 func getCaptchaVerifyParam() (string, error) {
     if captchaParamOverride != "" {
         return captchaParamOverride, nil
+    }
+    // Ops/test seam: CAPTCHA_PARAM_OVERRIDE forces a specific param (e.g. one
+    // minted by an external browser solver). Aliyun params are short-lived and
+    // single-use, so this is for one-shot verification, not production steady
+    // state.
+    if v := strings.TrimSpace(os.Getenv("CAPTCHA_PARAM_OVERRIDE")); v != "" {
+        return v, nil
     }
     if config.AgentMode {
         if val, ok := captchaCache.Get(); ok {
@@ -623,14 +637,21 @@ func getCaptchaVerifyParam() (string, error) {
     }
     ch := make(chan result, 1)
 
-    go func() {
-        payload := computeFinalPayload()
-        if payload == "" {
-            ch <- result{"", errors.New("captcha generation returned empty payload")}
-            return
-        }
-        ch <- result{payload, nil}
-    }()
+	go func() {
+		payload := computeFinalPayload()
+		if payload == "" {
+			// CAPTCHA_OPTIONAL=1：设备 token 池耗尽时放空 param 让请求继续，
+			// 由上游决定是否真的需要验证码（账号 token 路径上实测）。
+			if captchaOptional() {
+				log.Printf("[Captcha] device-token pool empty; sending empty captcha_verify_param (CAPTCHA_OPTIONAL)")
+				ch <- result{"", nil}
+				return
+			}
+			ch <- result{"", errors.New("captcha generation returned empty payload")}
+			return
+		}
+		ch <- result{payload, nil}
+	}()
 
     select {
     case r := <-ch:
@@ -639,7 +660,7 @@ func getCaptchaVerifyParam() (string, error) {
             log.Printf("[Captcha] ✗ error: %s", r.err.Error())
             return "", r.err
         }
-        if r.val == "" {
+        if r.val == "" && !captchaOptional() {
             log.Printf("[Captcha] ✗ empty response after %.1fs", elapsed)
             return "", errors.New("captcha generation returned empty response")
         }

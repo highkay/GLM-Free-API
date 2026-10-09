@@ -10,6 +10,7 @@ import (
     "crypto/hmac"
     "crypto/rand"
     "crypto/sha1"
+    "crypto/tls"
     "encoding/base64"
     "encoding/hex"
     "encoding/json"
@@ -24,6 +25,7 @@ import (
     "time"
 
     utls "github.com/refraction-networking/utls"
+    "golang.org/x/net/http2"
 )
 
 // ============================================================================
@@ -200,10 +202,15 @@ func dialUTLS(ctx context.Context, network, addr string) (net.Conn, error) {
         }
     }
 
-    // uTLS config — advertise HTTP/1.1 only to avoid HTTP/2 fingerprinting
+    // uTLS config — offer h2 first, fall back to http/1.1. chat.z.ai's edge
+    // (Alibaba CDN/ESA) now answers HTTP/2 even to http/1.1-only ALPN offers;
+    // an h1-only offer gets a raw HTTP/2 SETTINGS frame back that net/http
+    // misreads as "malformed HTTP response". Advertising h2 makes ALPN
+    // negotiate cleanly (the transport picks up the negotiated proto from the
+    // uTLS conn's ConnectionState when ForceAttemptHTTP2 is on).
     config := &utls.Config{
         ServerName:         host,
-        NextProtos:         []string{"http/1.1"},
+        NextProtos:         []string{"h2", "http/1.1"},
         InsecureSkipVerify: false,
     }
 
@@ -239,16 +246,44 @@ func (c *concatConn) Read(b []byte) (int, error) {
 // Z.AI client with cookie jar + uTLS Chrome fingerprint
 var zaiJar = &cookieJar{}
 
+// dualTransport routes https→uTLS/h2, plain http→stock h1 transport (tests
+// point the bridge at plain-HTTP mock servers; http2.Transport refuses
+// cleartext, so the mock path keeps the stock h1 transport).
+type dualTransport struct {
+    h1 http.RoundTripper
+    h2 http.RoundTripper
+}
+
+func (d dualTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+    if req.URL != nil && req.URL.Scheme == "http" {
+        return d.h1.RoundTrip(req)
+    }
+    return d.h2.RoundTrip(req)
+}
+
+// The uTLS Chrome ClientHello always offers h2 in ALPN regardless of
+// Config.NextProtos (probed: HelloChrome_Auto negotiates h2 even with an
+// h1-only NextProtos), and chat.z.ai's edge answers accordingly. A stock
+// net/http Transport with a custom DialTLSContext never upgrades to h2, so it
+// wrote an HTTP/1.1 request over an h2-negotiated connection and misread the
+// server's SETTINGS frame as a "malformed HTTP response". HTTPS goes through
+// x/net/http2's Transport (always h2) so the wire protocol matches the
+// negotiated ALPN.
 var zaiHTTPClient = &http.Client{
-    Transport: newPacedTransport(&http.Transport{
-        DialTLSContext:        dialUTLS,
-        MaxIdleConns:          100,
-        MaxIdleConnsPerHost:   20,
-        MaxConnsPerHost:       20,
-        IdleConnTimeout:       90 * time.Second,
-        TLSHandshakeTimeout:   15 * time.Second,
-        ExpectContinueTimeout: 1 * time.Second,
-        ForceAttemptHTTP2:     false,
+    Transport: newPacedTransport(dualTransport{
+        h1: &http.Transport{
+            MaxIdleConns:          100,
+            MaxIdleConnsPerHost:   20,
+            MaxConnsPerHost:       20,
+            IdleConnTimeout:       90 * time.Second,
+            TLSHandshakeTimeout:   15 * time.Second,
+            ExpectContinueTimeout: 1 * time.Second,
+        },
+        h2: &http2.Transport{
+            DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
+                return dialUTLS(ctx, network, addr)
+            },
+        },
     }),
     Jar: zaiJar,
 }
