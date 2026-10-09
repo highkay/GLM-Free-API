@@ -50,6 +50,12 @@ func NewHandler() http.Handler {
     // Hot-swap the active tokens.sqlite without restarting the server.
     // Auth-protected like every other mutating endpoint.
     mux.HandleFunc("/sqlite", authMiddleware(sqliteSwapHandler))
+    // Account-token pool management (registered-account Z.AI bearer tokens).
+    // Auth-protected like every other mutating endpoint.
+    mux.HandleFunc("POST /v1/tokens", authMiddleware(tokenAddHandler))
+    mux.HandleFunc("GET /v1/tokens", authMiddleware(tokenListHandler))
+    mux.HandleFunc("DELETE /v1/tokens/{id}", authMiddleware(tokenDeleteHandler))
+    mux.HandleFunc("POST /v1/tokens/delete", authMiddleware(tokenDeleteHandler))
 
     return corsMiddleware(mux)
 }
@@ -58,6 +64,7 @@ func NewHandler() http.Handler {
 // termination signal. Called from the root package's main().
 func Run() {
     flag.StringVar(&dbPath, "db-path", "tokens.sqlite", "Path to SQLite database")
+    flag.StringVar(&accountsDBPath, "accounts-db-path", "accounts.sqlite", "Path to account-token SQLite database")
     flag.BoolVar(&verbose, "verbose", false, "Enable verbose logging")
     flag.BoolVar(&config.AgentMode, "agent-mode", config.AgentMode, "Enable agent mode: translate tools & roles for Z.AI compatibility (modern shim by default)")
     flag.StringVar(&config.AgentModeVariant, "agent-mode-variant", config.AgentModeVariant, "Agent mode shim variant: modern (default, XML-sectioned prompt) or legacy ([ROLE: ...] rewrite)")
@@ -68,8 +75,7 @@ func Run() {
     flag.Parse()
 
     if _, err := os.Stat(dbPath); err != nil {
-        log.Println("Captcha db not found! Please run the token collector first (cmd/token-collector)")
-        os.Exit(1)
+        log.Println("Captcha db not found — an empty one will be created (fill it via the collector or POST /sqlite)")
     }
 
     logInfo("Starting with db-path='" + dbPath + "' verbose=true")
@@ -79,6 +85,15 @@ func Run() {
         os.Exit(1)
     }
     defer closeDB()
+
+    // Account-token store (accounts.sqlite) — auto-created empty if absent;
+    // unlike the device-token DB, missing is fine because tokens are pushed
+    // later via POST /v1/tokens.
+    if err := initAccountTokenDB(accountsDBPath); err != nil {
+        fmt.Fprintf(os.Stderr, "Failed to open account token store: %v\n", err)
+        os.Exit(1)
+    }
+    logInfo("Account token store ready: " + accountsDBPath)
 
     gRunning.Store(true)
 

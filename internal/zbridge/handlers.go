@@ -8,6 +8,7 @@ import (
     "io"
     "log"
     "net/http"
+    "strconv"
     "strings"
     "sync"
     "time"
@@ -701,9 +702,10 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
         status = 503
     }
     writeJSON(w, status, map[string]interface{}{
-        "healthy":    healthy,
-        "mode":       "direct",
-        "tokenCount": tokenCount,
+        "healthy":           healthy,
+        "mode":              "direct",
+        "tokenCount":        tokenCount,
+        "accountTokenCount": accountTokenCount(),
     })
 }
 
@@ -788,4 +790,109 @@ func stopHandler(w http.ResponseWriter, r *http.Request) {
         "message": "Stop acknowledged",
     })
 }
+
+// ============================================================================
+// ACCOUNT TOKEN POOL API (/v1/tokens)
+// ============================================================================
+//
+// The account-token pool holds registered-account Z.AI bearer tokens (the
+// session identity the bridge talks to chat.z.ai with). It is separate from
+// the device-token pool (tokens.sqlite) — those are Aliyun captcha tokens,
+// these are Z.AI account JWTs.
+
+// tokenAddHandler — POST /v1/tokens {"token": "...", "label": "..."}
+func tokenAddHandler(w http.ResponseWriter, r *http.Request) {
+    var body struct {
+        Token string `json:"token"`
+        Label string `json:"label"`
+    }
+    if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+        writeJSON(w, http.StatusBadRequest, map[string]interface{}{
+            "success": false, "error": "invalid JSON body: " + err.Error(),
+        })
+        return
+    }
+    if strings.TrimSpace(body.Token) == "" {
+        writeJSON(w, http.StatusBadRequest, map[string]interface{}{
+            "success": false, "error": "missing required field 'token'",
+        })
+        return
+    }
+    id, err := addAccountToken(body.Token, body.Label)
+    if err != nil {
+        writeJSON(w, http.StatusBadRequest, map[string]interface{}{
+            "success": false, "error": err.Error(),
+        })
+        return
+    }
+    logInfo(fmt.Sprintf("[AccountTokens] added id=%d label=%q", id, body.Label))
+    writeJSON(w, http.StatusOK, map[string]interface{}{
+        "success": true,
+        "id":      id,
+        "count":   accountTokenCount(),
+    })
+}
+
+// tokenListHandler — GET /v1/tokens
+func tokenListHandler(w http.ResponseWriter, r *http.Request) {
+    rows, count, err := listAccountTokens()
+    if err != nil {
+        writeJSON(w, http.StatusInternalServerError, map[string]interface{}{
+            "success": false, "error": err.Error(),
+        })
+        return
+    }
+    if rows == nil {
+        rows = []accountTokenRow{}
+    }
+    writeJSON(w, http.StatusOK, map[string]interface{}{
+        "success": true,
+        "count":   count,
+        "tokens":  rows,
+    })
+}
+
+// tokenDeleteHandler — DELETE /v1/tokens/{id}  (or POST /v1/tokens/delete {"id": n})
+func tokenDeleteHandler(w http.ResponseWriter, r *http.Request) {
+    var id int64
+    if raw := r.PathValue("id"); raw != "" {
+        n, err := strconv.ParseInt(raw, 10, 64)
+        if err != nil {
+            writeJSON(w, http.StatusBadRequest, map[string]interface{}{
+                "success": false, "error": "invalid id: " + raw,
+            })
+            return
+        }
+        id = n
+    } else {
+        var body struct {
+            ID int64 `json:"id"`
+        }
+        if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+            writeJSON(w, http.StatusBadRequest, map[string]interface{}{
+                "success": false, "error": "invalid JSON body: " + err.Error(),
+            })
+            return
+        }
+        id = body.ID
+    }
+    if id <= 0 {
+        writeJSON(w, http.StatusBadRequest, map[string]interface{}{
+            "success": false, "error": "missing token id",
+        })
+        return
+    }
+    if err := deleteAccountToken(id); err != nil {
+        writeJSON(w, http.StatusNotFound, map[string]interface{}{
+            "success": false, "error": err.Error(),
+        })
+        return
+    }
+    logInfo(fmt.Sprintf("[AccountTokens] deleted id=%d", id))
+    writeJSON(w, http.StatusOK, map[string]interface{}{
+        "success": true,
+        "count":   accountTokenCount(),
+    })
+}
+
 

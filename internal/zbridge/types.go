@@ -30,6 +30,10 @@ type Message struct {
 type SessionState struct {
     mu           sync.Mutex
     Token        string
+    // TokenID is the account-token pool row id backing Token (0 when the
+    // token came from ZAI_TOKEN env or the guest flow). Tracked so a 401 can
+    // mark that pool row failed and rotate to the next account token.
+    TokenID      int64
     UserID       string
     UserName     string
     ChatID       string
@@ -145,10 +149,11 @@ type Track struct {
 // hot-swappable dbState holder: see globalDBState / withTokenDB / swapDB.
 
 var (
-    dbPath   string
-    verbose  bool
-    gRunning atomic.Bool
-    logMu    sync.Mutex
+    dbPath         string
+    accountsDBPath string
+    verbose        bool
+    gRunning       atomic.Bool
+    logMu          sync.Mutex
 )
 
 // ---------- Z.AI globals ----------

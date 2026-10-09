@@ -44,6 +44,7 @@ import (
     "database/sql"
     "errors"
     "fmt"
+    "log"
     "os"
     "strconv"
     "sync"
@@ -444,9 +445,22 @@ func swapDB(newPath string) error {
 
 // initDB opens dbPath and attaches it as the active database. Kept under its
 // historical name so run.go's startup flow is unchanged.
+//
+// Missing file policy: the bridge historically hard-exited so operators would
+// "run the token collector first". Container/headless deployments have no
+// collector, so instead we auto-create an EMPTY database with the expected
+// schema and let it fill in later (collector output, or POST /sqlite
+// hot-swap). The captcha path keeps working structurally — it just reports
+// "no device tokens" until one arrives.
 func initDB() error {
     if _, err := os.Stat(dbPath); err != nil {
-        return err
+        if !os.IsNotExist(err) {
+            return err
+        }
+        if err := createEmptyTokenDB(dbPath); err != nil {
+            return fmt.Errorf("create empty captcha db %q: %w", dbPath, err)
+        }
+        log.Printf("[Startup] Captcha db %q not found — created an empty one (fill it via the token collector or POST /sqlite)", dbPath)
     }
     db, err := openTokenDB(dbPath)
     if err != nil {
@@ -454,6 +468,22 @@ func initDB() error {
     }
     attachDB(db, dbPath)
     return nil
+}
+
+// createEmptyTokenDB materialises path as a SQLite file with the collector's
+// `tokens` schema and zero rows.
+func createEmptyTokenDB(path string) error {
+    db, err := openTokenDB(path)
+    if err != nil {
+        return err
+    }
+    defer db.Close()
+    _, err = db.Exec(`CREATE TABLE IF NOT EXISTS tokens (
+        id    INTEGER PRIMARY KEY AUTOINCREMENT,
+        token TEXT    NOT NULL,
+        batch INTEGER NOT NULL
+    );`)
+    return err
 }
 
 // closeDB closes the active database if one is attached (shutdown path).

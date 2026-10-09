@@ -157,6 +157,29 @@ func initializeSession() error {
         session.mu.Unlock()
     }()
 
+    // Priority: account-token pool (registered accounts, rotated on failure)
+    // → ZAI_TOKEN env → guest bootstrap.
+    if id, tok, ok := acquireAccountToken(); ok {
+        session.Token = tok
+        session.TokenID = id
+        uid, name := decodeJWT(tok)
+        session.UserID = uid
+        if name != "" {
+            session.UserName = name
+        }
+        if session.UserID == "" {
+            session.UserName = "User"
+        }
+        uidPreview := session.UserID
+        if len(uidPreview) > 8 {
+            uidPreview = uidPreview[:8]
+        }
+        log.Printf("[Session] Using account token #%d: %s... (%s)", id, uidPreview, session.UserName)
+        session.Initialized = true
+        return nil
+    }
+    session.TokenID = 0
+
     if config.ZaiToken != "" {
         log.Println("[Session] Using hardcoded ZAI_TOKEN, skipping guest init.")
         session.Token = config.ZaiToken
@@ -563,6 +586,14 @@ func sendToZAIStream(prompt string, opts struct {
             resp.Body.Close()
             cancel()
             session.mu.Lock()
+            // A pooled account token that just 401'd is marked failed so the
+            // rotation below (next initializeSession call) moves to the next
+            // account instead of re-picking the dead one.
+            if session.TokenID != 0 {
+                markAccountTokenResult(session.TokenID, false)
+                log.Printf("[Session] Account token #%d 401'd; rotating", session.TokenID)
+            }
+            session.TokenID = 0
             session.Initialized = false
             session.mu.Unlock()
             if err := initializeSession(); err != nil {
@@ -597,6 +628,13 @@ func sendToZAIStream(prompt string, opts struct {
             // blocked; keep the breaker closed even if it was left open by
             // a stale observation.
             RecordWAFSuccess()
+            // Successful completion on a pooled account token: reset its
+            // failure streak and stamp last-used so round-robin rotates fairly.
+            session.mu.Lock()
+            if session.TokenID != 0 {
+                markAccountTokenResult(session.TokenID, true)
+            }
+            session.mu.Unlock()
         }
         return err
     }
